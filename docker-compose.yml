@@ -10,8 +10,8 @@ services:
       - ./charts:/app/charts
     environment:
       # ===================== WAJIB DIISI =====================
-      - TELEGRAM_BOT_TOKEN=8727771873:AAHTs6sLU0Y6WcZwADSZ3C_Mal0R502Eaqw
-      - TELEGRAM_CHAT_ID=-1003793153261
+      - TELEGRAM_BOT_TOKEN=
+      - TELEGRAM_CHAT_ID=
 
       # (SANGAT DISARANKAN) Pisahkan chat:
       # - SIGNALS: hanya pesan entry (dibaca Cornix)
