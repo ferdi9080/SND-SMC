@@ -315,6 +315,7 @@ class SetupState:
     state: str = "SEARCHING"
     extreme_price: float = 0.0
     choch_level: float = 0.0
+    breakout_price: float = 0.0
 
     # one-shot flags per cycle
     confirmed_sent: bool = False
@@ -816,6 +817,8 @@ class SignalEngine:
 
         lines.append("Stop Targets:")
         lines.append(f"1) {self._fmt(sl)}")
+        
+        lines.append("Trailing Stop: Moving Target")
 
         info = f"Info: TF={st.tf} | Harga={self._fmt(price)} | Z1({zname})={self._fmt(st.zone1.low)}-{self._fmt(st.zone1.high)}"
         if st.zone2:
@@ -888,6 +891,7 @@ class SignalEngine:
         highs = [float(c["high"]) for c in ohlc]
         lows = [float(c["low"]) for c in ohlc]
         closes = [float(c["close"]) for c in ohlc]
+        volumes = [float(c["volume"]) for c in ohlc]
         curr_idx = len(ohlc) - 1
 
         buy_key = (symbol, tf, "BUY")
@@ -911,90 +915,183 @@ class SignalEngine:
             st_sell.zone1 = supply
             st_sell.zone2 = fvg_sell
 
-        self._process_smc_state(st_buy, price, demand, opens, highs, lows, closes, curr_idx)
-        self._process_smc_state(st_sell, price, supply, opens, highs, lows, closes, curr_idx)
+        self._process_smc_state(st_buy, price, demand, opens, highs, lows, closes, volumes, curr_idx)
+        self._process_smc_state(st_sell, price, supply, opens, highs, lows, closes, volumes, curr_idx)
 
-    def _process_smc_state(self, st: SetupState, price: float, active_zone: Optional[Zone], opens: List[float], highs: List[float], lows: List[float], closes: List[float], curr_idx: int) -> None:
+    def _process_smc_state(self, st: SetupState, price: float, active_zone: Optional[Zone], opens: List[float], highs: List[float], lows: List[float], closes: List[float], volumes: List[float], curr_idx: int) -> None:
         if st.state == "SEARCHING":
             if not active_zone: return
             if st.side == "BUY" and price <= active_zone.high + st.buffer:
-                st.state = "TAPPED_Z1"
+                st.state = "WAITING_CHOCH"
                 st.extreme_price = price
+                st.choch_level = get_internal_swing_high(highs, curr_idx)
             elif st.side == "SELL" and price >= active_zone.low - st.buffer:
-                st.state = "TAPPED_Z1"
+                st.state = "WAITING_CHOCH"
                 st.extreme_price = price
+                st.choch_level = get_internal_swing_low(lows, curr_idx)
 
-        elif st.state == "TAPPED_Z1":
+        elif st.state == "WAITING_CHOCH":
             if not active_zone: 
                 st.reset_cycle()
                 return
 
+            last_idx = curr_idx - 1
+            vol_sma20 = sum(volumes[max(0, last_idx-20):last_idx]) / 20.0 if last_idx >= 20 else sum(volumes[:last_idx])/(last_idx or 1)
+
             if st.side == "BUY":
                 if price < st.extreme_price: st.extreme_price = price
-                # Rejection: Bullish close, tapped Z1
-                if closes[curr_idx] > opens[curr_idx] and lows[curr_idx] <= active_zone.high + st.buffer:
+                
+                # Invalidated if price fully closes below Z1
+                if closes[last_idx] < active_zone.low:
+                    st.state = "SEEKING_FVG"
+                    return
+                
+                # Valid CHoCH Breakout: closes above choch_level WITH high volume
+                if closes[last_idx] > st.choch_level and volumes[last_idx] > vol_sma20:
+                    st.state = "WAITING_RETEST"
+                    # Capture the peak of the breakout for fibonacci retest
+                    st.breakout_price = highs[last_idx]
+
+            elif st.side == "SELL":
+                if price > st.extreme_price: st.extreme_price = price
+                
+                # Invalidated if price fully closes above Z1
+                if closes[last_idx] > active_zone.high:
+                    st.state = "SEEKING_FVG"
+                    return
+                
+                # Valid CHoCH Breakout: closes below choch_level WITH high volume
+                if closes[last_idx] < st.choch_level and volumes[last_idx] > vol_sma20:
+                    st.state = "WAITING_RETEST"
+                    # Capture the trough of the breakout for fibonacci retest
+                    st.breakout_price = lows[last_idx]
+
+        elif st.state == "WAITING_RETEST":
+            last_idx = curr_idx - 1
+            vol_sma20 = sum(volumes[max(0, last_idx-20):last_idx]) / 20.0 if last_idx >= 20 else sum(volumes[:last_idx])/(last_idx or 1)
+
+            if st.side == "BUY":
+                # Entry condition: Price pulls back to 50% discount
+                discount_level = st.extreme_price + (st.breakout_price - st.extreme_price) * 0.5
+                
+                # Stop hunting during retest: if it drops below extreme, invalidated
+                if price < st.extreme_price:
+                    st.reset_cycle()
+                    return
+
+                # Retest triggered: price <= discount_level AND volume is drying up (volume < SMA)
+                if price <= discount_level and volumes[last_idx] < vol_sma20:
                     st.state = "SETUP1_ACTIVE"
-                    entry_p = closes[curr_idx]
-                    st.setup_type = "[SETUP 1] Demand Rejection"
-                    # Tight SL below extreme
-                    sl = st.extreme_price - (st.atr * 0.2)
+                    entry_p = price
+                    st.setup_type = "[SETUP 1] CHoCH + Retest Demand"
+                    # Safe SL below extreme or bottom of Zone 1
+                    sl_base = min(st.extreme_price, active_zone.low) if active_zone else st.extreme_price
+                    sl = sl_base - (st.atr * 0.2)
                     if sl >= entry_p: sl = entry_p - max(st.atr * 1.0, entry_p * 0.005)
                     self._set_levels(st, entry_p, sl, "BUY")
                     self._send_confirmed(st, price, "Z1 Demand")
-                elif closes[curr_idx] < active_zone.low:
-                    # Broke Z1, seek FVG
-                    st.state = "SEEKING_FVG"
 
             elif st.side == "SELL":
-                if price > st.extreme_price: st.extreme_price = price
-                # Rejection: Bearish close, tapped Z1
-                if closes[curr_idx] < opens[curr_idx] and highs[curr_idx] >= active_zone.low - st.buffer:
+                # Entry condition: Price pulls back to 50% premium
+                discount_level = st.extreme_price - (st.extreme_price - st.breakout_price) * 0.5
+                
+                # Stop hunting during retest: if it goes above extreme, invalidated
+                if price > st.extreme_price:
+                    st.reset_cycle()
+                    return
+
+                # Retest triggered: price >= discount_level AND volume is drying up (volume < SMA)
+                if price >= discount_level and volumes[last_idx] < vol_sma20:
                     st.state = "SETUP1_ACTIVE"
-                    entry_p = closes[curr_idx]
-                    st.setup_type = "[SETUP 1] Supply Rejection"
-                    # Tight SL above extreme
-                    sl = st.extreme_price + (st.atr * 0.2)
+                    entry_p = price
+                    st.setup_type = "[SETUP 1] CHoCH + Retest Supply"
+                    sl_base = max(st.extreme_price, active_zone.high) if active_zone else st.extreme_price
+                    sl = sl_base + (st.atr * 0.2)
                     if sl <= entry_p: sl = entry_p + max(st.atr * 1.0, entry_p * 0.005)
                     self._set_levels(st, entry_p, sl, "SELL")
                     self._send_confirmed(st, price, "Z1 Supply")
-                elif closes[curr_idx] > active_zone.high:
-                    # Broke Z1, seek FVG
-                    st.state = "SEEKING_FVG"
 
         elif st.state == "SEEKING_FVG":
             if not st.zone2: 
-                # No FVG to sweep into, abandon
                 st.reset_cycle()
                 return
-                
+
+            if st.side == "BUY":
+                if price <= st.zone2.high + st.buffer:
+                    st.state = "FVG_WAITING_CHOCH"
+                    st.extreme_price = price
+                    st.choch_level = get_internal_swing_high(highs, curr_idx)
+
+            elif st.side == "SELL":
+                if price >= st.zone2.low - st.buffer:
+                    st.state = "FVG_WAITING_CHOCH"
+                    st.extreme_price = price
+                    st.choch_level = get_internal_swing_low(lows, curr_idx)
+
+        elif st.state == "FVG_WAITING_CHOCH":
+            if not st.zone2: 
+                st.reset_cycle()
+                return
+
+            last_idx = curr_idx - 1
+            vol_sma20 = sum(volumes[max(0, last_idx-20):last_idx]) / 20.0 if last_idx >= 20 else sum(volumes[:last_idx])/(last_idx or 1)
+
             if st.side == "BUY":
                 if price < st.extreme_price: st.extreme_price = price
-                # If price completely breaks FVG, invalidate
-                if closes[curr_idx] < st.zone2.low:
+                
+                if closes[last_idx] < st.zone2.low:
                     st.reset_cycle()
                     return
-                # Touch FVG & Reject
-                if price <= st.zone2.high + st.buffer and closes[curr_idx] > opens[curr_idx]:
+                
+                if closes[last_idx] > st.choch_level and volumes[last_idx] > vol_sma20:
+                    st.state = "FVG_WAITING_RETEST"
+                    st.breakout_price = highs[last_idx]
+
+            elif st.side == "SELL":
+                if price > st.extreme_price: st.extreme_price = price
+                
+                if closes[last_idx] > st.zone2.high:
+                    st.reset_cycle()
+                    return
+                
+                if closes[last_idx] < st.choch_level and volumes[last_idx] > vol_sma20:
+                    st.state = "FVG_WAITING_RETEST"
+                    st.breakout_price = lows[last_idx]
+
+        elif st.state == "FVG_WAITING_RETEST":
+            last_idx = curr_idx - 1
+            vol_sma20 = sum(volumes[max(0, last_idx-20):last_idx]) / 20.0 if last_idx >= 20 else sum(volumes[:last_idx])/(last_idx or 1)
+
+            if st.side == "BUY":
+                discount_level = st.extreme_price + (st.breakout_price - st.extreme_price) * 0.5
+                
+                if price < st.extreme_price:
+                    st.reset_cycle()
+                    return
+
+                if price <= discount_level and volumes[last_idx] < vol_sma20:
                     st.state = "SETUP2_ACTIVE"
-                    entry_p = closes[curr_idx]
-                    st.setup_type = "[SETUP 2] FVG Deep Sweep Rejection"
-                    sl = st.extreme_price - (st.atr * 0.2)
+                    entry_p = price
+                    st.setup_type = "[SETUP 2] FVG CHoCH + Retest Demand"
+                    sl_base = min(st.extreme_price, st.zone2.low) if st.zone2 else st.extreme_price
+                    sl = sl_base - (st.atr * 0.2)
                     if sl >= entry_p: sl = entry_p - max(st.atr * 1.0, entry_p * 0.005)
                     self._set_levels(st, entry_p, sl, "BUY")
                     self._send_confirmed(st, price, "Z2 FVG")
-            
+
             elif st.side == "SELL":
-                if price > st.extreme_price: st.extreme_price = price
-                # If price completely breaks FVG, invalidate
-                if closes[curr_idx] > st.zone2.high:
+                discount_level = st.extreme_price - (st.extreme_price - st.breakout_price) * 0.5
+                
+                if price > st.extreme_price:
                     st.reset_cycle()
                     return
-                # Touch FVG & Reject
-                if price >= st.zone2.low - st.buffer and closes[curr_idx] < opens[curr_idx]:
+
+                if price >= discount_level and volumes[last_idx] < vol_sma20:
                     st.state = "SETUP2_ACTIVE"
-                    entry_p = closes[curr_idx]
-                    st.setup_type = "[SETUP 2] FVG Deep Sweep Rejection"
-                    sl = st.extreme_price + (st.atr * 0.2)
+                    entry_p = price
+                    st.setup_type = "[SETUP 2] FVG CHoCH + Retest Supply"
+                    sl_base = max(st.extreme_price, st.zone2.high) if st.zone2 else st.extreme_price
+                    sl = sl_base + (st.atr * 0.2)
                     if sl <= entry_p: sl = entry_p + max(st.atr * 1.0, entry_p * 0.005)
                     self._set_levels(st, entry_p, sl, "SELL")
                     self._send_confirmed(st, price, "Z2 FVG")
@@ -1055,8 +1152,12 @@ class SignalEngine:
             tp2 = entry - risk * 4.0
             tp3 = entry - risk * 8.0
             
+        # Entry Range from the 50% discount trigger down/up to the absolute Extreme structure level
+        emin = min(entry, st.extreme_price)
+        emax = max(entry, st.extreme_price)
+            
         st.levels = {
-            "entry": entry, "entry_min": entry, "entry_max": entry, 
+            "entry": entry, "entry_min": emin, "entry_max": emax, 
             "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3
         }
 

@@ -2,8 +2,8 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM ===================== WAJIB DIISI =====================
-set TELEGRAM_BOT_TOKEN=
-set TELEGRAM_CHAT_ID=
+set TELEGRAM_BOT_TOKEN=8727771873:AAHTs6sLU0Y6WcZwADSZ3C_Mal0R502Eaqw
+set TELEGRAM_CHAT_ID=-1003793153261
 
 REM (SANGAT DISARANKAN) Pisahkan chat:
 REM - SIGNALS: hanya pesan entry (dibaca Cornix)
